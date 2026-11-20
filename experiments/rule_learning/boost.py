@@ -206,6 +206,27 @@ def info_gain(mass, confidence, prior):
     return mass * (c * np.log(c / p) + (1 - c) * np.log((1 - c) / (1 - p)))
 
 
+def exportRules(ruleSets, relations, nRel, path):
+    """Write the learned rule set in AnyBURL's rule-file format for external scoring."""
+    nBodies = 0
+    with open(path, "w", encoding="utf-8") as f:
+        for h, rules in ruleSets.items():
+            for rule in rules:
+                atoms, prev = [], "X"
+                body = rule["body"]
+                for i, atom in enumerate(body):
+                    rel = atom if atom < nRel else atom - nRel
+                    inverted = atom >= nRel
+                    nxt = "Y" if i == len(body) - 1 else "ABC"[i]
+                    u, v = (nxt, prev) if inverted else (prev, nxt)
+                    atoms.append("{}({},{})".format(relations[rel], u, v))
+                    prev = nxt
+                f.write("{}\t{}\t{}\t{}(X,Y) <= {}\n".format(
+                    int(rule["support"]), len(body), rule["confidence"], relations[h], ", ".join(atoms)))
+                nBodies += 1
+    print("exported {} rules to {}".format(nBodies, path), flush=True)
+
+
 def atomName(relations, atom, nRel):
     return relations[atom] if atom < nRel else "inv(" + relations[atom - nRel] + ")"
 
@@ -245,12 +266,12 @@ def evaluate(cores, ruleSets, n, relations, entIndex, relIndex, trainIdx, extraP
                            np.array([t for _, _, t in trainIdx], dtype=np.int64)), 1.0)
 
     ranks, positives, t0 = [], [], time.time()
-    unruled = sum(1 for hIdx in byHead if not ruleSets[hIdx])
+    unruled = sum(1 for hIdx in byHead if not ruleSets.get(hIdx))
     for hIdx in sorted(byHead):
-        rules = ruleSets[hIdx]
+        rules = ruleSets.get(hIdx, [])
         score = None
         for rule in ([] if priorOnly else rules):
-            path = chain(cores, rule["body"])
+            path = rule["matrix"] if "matrix" in rule else chain(cores, rule["body"])
             term = (path > 0).astype(np.float32) * rule["confidence"]
             if score is None:
                 score = term
@@ -333,6 +354,7 @@ if __name__ == "__main__":
     parser.add_argument("--maxTest", type=int, default=None)
     parser.add_argument("--priorOnly", action="store_true")
     parser.add_argument("--inverse", action="store_true")
+    parser.add_argument("--export", default=None)
     args = parser.parse_args()
     if args.selftest:
         selftest()
@@ -344,6 +366,8 @@ if __name__ == "__main__":
         cores, ruleSets, bodies, n, total = learn_rules(entities, relations, rows, cols, rIdx,
                                                         args.depth, args.rules, args.minSupport,
                                                         args.maxBodies, args.inverse)
+        if args.export:
+            exportRules(ruleSets, relations, len(relations), args.export)
         trainIdx = list(zip(rows.tolist(), rIdx.tolist(), cols.tolist()))
         evaluate(cores, ruleSets, n, relations, entIndex, relIndex, trainIdx,
                  [os.path.join(args.dir, "valid.txt")], os.path.join(args.dir, "test.txt"),
