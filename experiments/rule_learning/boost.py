@@ -149,6 +149,7 @@ def learn_rules(entities, relations, rows, cols, rIdx, depth, ruleCount, minSupp
     headKeys = [np.sort(encode(rows[rIdx == h], cols[rIdx == h], n)) for h in range(nRel)]
     candKeys = {k: sorted_keys(p, n) for k, p in paths.items()}
 
+    headSizes = [int(headCores[h].nnz) for h in range(nRel)]
     ruleSets, shortlistSize = {}, max(60, 4 * ruleCount)
     for h in range(nRel):
         ruleSets[h] = []
@@ -163,21 +164,26 @@ def learn_rules(entities, relations, rows, cols, rIdx, depth, ruleCount, minSupp
             pos = np.minimum(np.searchsorted(candKeys[k], keys), candKeys[k].size - 1)
             hitsOf[k] = np.nonzero(candKeys[k][pos] == keys)[0]
         covered = np.zeros(keys.size, dtype=bool)
+        baseRate = headSizes[h] / float(n * n)
         for _ in range(ruleCount):
             best = None
             for k, hits in hitsOf.items():
                 if any(rule["cand"] == k for rule in ruleSets[h]):
                     continue
                 residual = int((~covered[hits]).sum())
-                if residual >= minSupport and (best is None or residual > best[0]):
-                    best = (residual, k)
+                if residual < minSupport:
+                    continue
+                precision = residual / max(float(bodyNnz[h, k]), 1.0)
+                gain = info_gain(residual, precision, baseRate)
+                if gain > 0 and (best is None or gain > best[0]):
+                    best = (gain, k, residual, precision)
             if best is None:
                 break
-            residual, k = best
+            gain, k, residual, precision = best
             covered[hitsOf[k]] = True
             ruleSets[h].append({"cand": k, "body": allBodies[k], "support": float(support[h, k]),
                                 "confidence": float(support[h, k] / max(float(bodyNnz[h, k]), 1.0)),
-                                "residual": residual})
+                                "residual": residual, "gain": float(gain)})
         if ruleSets[h]:
             top = ruleSets[h][0]
             print("{:<42} rules={} conf={:.3f} depth={} body={} support={:g}".format(
@@ -187,6 +193,17 @@ def learn_rules(entities, relations, rows, cols, rIdx, depth, ruleCount, minSupp
     total = sum(len(v) for v in ruleSets.values())
     print("learned {} rules over {} head relations".format(total, nRel), flush=True)
     return cores, ruleSets, allBodies, n, total
+
+
+def info_gain(mass, confidence, prior):
+    """Residual mass times the log-odds improvement over the base rate.
+
+    This is the negative phase entering as the prior: a rule is worth adding only if its
+    precision on the uncovered mass beats the head relation's base rate.
+    """
+    c = min(max(confidence, 1e-12), 1 - 1e-12)
+    p = min(max(prior, 1e-12), 1 - 1e-12)
+    return mass * (c * np.log(c / p) + (1 - c) * np.log((1 - c) / (1 - p)))
 
 
 def atomName(relations, atom, nRel):
@@ -228,10 +245,9 @@ def evaluate(cores, ruleSets, n, relations, entIndex, relIndex, trainIdx, extraP
                            np.array([t for _, _, t in trainIdx], dtype=np.int64)), 1.0)
 
     ranks, positives, t0 = [], [], time.time()
+    unruled = sum(1 for hIdx in byHead if not ruleSets[hIdx])
     for hIdx in sorted(byHead):
         rules = ruleSets[hIdx]
-        if not rules:
-            continue
         score = None
         for rule in ([] if priorOnly else rules):
             path = chain(cores, rule["body"])
@@ -265,8 +281,8 @@ def evaluate(cores, ruleSets, n, relations, entIndex, relIndex, trainIdx, extraP
     if ranks.size == 0:
         print("no test triple covered by any rule", flush=True)
         return None
-    print("\nfiltered evaluation on {} of {} test triples ({:.1f}s), aggregation={}".format(
-        ranks.size, len(test), time.time() - t0, aggregation), flush=True)
+    print("\nfiltered evaluation on all {} test triples, {} head relations without rules ({:.1f}s), "
+          "aggregation={}".format(ranks.size, unruled, time.time() - t0, aggregation), flush=True)
     print("mean scored candidates per query: {:.2f} of {}".format(positives.mean(), n), flush=True)
     print("MRR {:.4f}  Hits@1 {:.4f}  Hits@3 {:.4f}  Hits@10 {:.4f}".format(
         float((1.0 / ranks).mean()), float((ranks <= 1).mean()),
