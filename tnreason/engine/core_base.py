@@ -22,9 +22,17 @@ class TensorCore:
         return "## Core " + self.name + " ##\nType: " + str(self.coreType) + " ##\nShape: " + str(
             self.shape) + "\nColors: " + str(self.colors)
 
-    def __eq__(self, other):
+    def __eq__new(self, other):
         """
         Cores are considered equal, when storing the same tensor. Thus, the equality check is ignorant about the core type.
+        """
+        from tnreason.engine.core_comparison import cores_equal
+
+        return cores_equal(self, other)
+
+    def __eq__(self, other):
+        """
+        Previous coordinate-wise equality implementation, kept for reference and fallback checks.
         """
         if sorted(self.shape) != sorted(other.shape):  # Check whether mismatch in shape or dimDict
             return False
