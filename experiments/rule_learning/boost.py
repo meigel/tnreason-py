@@ -81,6 +81,7 @@ _SPARSE_LEFT = None
 _SPARSE_RIGHT = None
 _FEATURES = None
 _NEGATIVE = []
+_ACCEPTANCE = "info_gain"
 
 
 def load_features(path, entities):
@@ -378,7 +379,9 @@ def learn_rules(entities, relations, rows, cols, rIdx, depth, ruleCount, minSupp
                 if residual < minSupport:
                     continue
                 precision = residual / max(float(bodyNnz[h, k]), 1.0)
-                gain = info_gain(residual, precision, baseRate)
+                gain = (info_gain(residual, precision, baseRate) if _ACCEPTANCE == "info_gain"
+                        else likelihood_gain(residual, float(support[h, k]), float(bodyNnz[h, k]),
+                                             baseRate))
                 if gain > 0 and (best is None or gain > best[0]):
                     best = (gain, k, residual, precision)
             if best is None:
@@ -507,6 +510,18 @@ def info_gain(mass, confidence, prior):
     c = min(max(confidence, 1e-12), 1 - 1e-12)
     p = min(max(prior, 1e-12), 1 - 1e-12)
     return mass * (c * np.log(c / p) + (1 - c) * np.log((1 - c) / (1 - p)))
+
+
+def likelihood_gain(residual, support, bodyNnz, baseRate):
+    """Positive minus negative phase of the likelihood gradient, on the uncovered mass.
+
+    Adding a body to the model changes the log-likelihood by the mass it places on facts that are not
+    yet explained, minus the mass it places where the current model expects facts and finds none. The
+    current model is a base-rate marginal, which is the first term of a contrastive-divergence step.
+    """
+    positive = float(residual)
+    negative = max(float(bodyNnz - support), 0.0) * min(max(baseRate, 0.0), 1.0)
+    return positive - negative
 
 
 def exportRules(ruleSets, relations, nRel, path):
@@ -816,6 +831,7 @@ if __name__ == "__main__":
     parser.add_argument("--dumpRanks", default=None)
     parser.add_argument("--pricing", default="sparse", choices=["sparse", "tnreason", "tnreason-sparse"])
     parser.add_argument("--features", default=None)
+    parser.add_argument("--acceptance", default="info_gain", choices=["info_gain", "likelihood"])
     parser.add_argument("--negation", type=float, default=None,
                         help="negate relations whose density exceeds this value")
     parser.add_argument("--constselftest", action="store_true")
@@ -837,8 +853,9 @@ if __name__ == "__main__":
             import sys as _sys
             values, _seen = load_features(args.features, entities)
             _sys.modules[__name__]._FEATURES = values
+        import sys as _sys
+        _sys.modules[__name__]._ACCEPTANCE = args.acceptance
         if args.negation is not None:
-            import sys as _sys
             forward = K.relation_cores(rows, cols, rIdx, len(entities), len(relations))
             densities = np.asarray([m.nnz for m in forward], dtype=np.float64) / \
                 float(len(entities) ** 2)
