@@ -76,6 +76,19 @@ def stride(items, limit):
 
 
 def chain(cores, body):
+    """Score matrix over (X,Y) for a body: a path, or a fork joined off that path.
+
+    A body is either a tuple of atom indices, meaning a chain X -> ... -> Y, or
+    ("fz", a, b) meaning r_a(X,Z) and r_b(Y,Z) with Z shared off the path, or
+    ("fx", a, b) meaning r_a(Z,X) and r_b(Z,Y).
+    """
+    if isinstance(body[0], str):
+        mode, atoms = body[0], body[1:]
+        if mode == "fz":
+            return (cores[atoms[0]] @ cores[atoms[1]].T).tocsr()
+        if mode == "fx":
+            return (cores[atoms[0]].T @ cores[atoms[1]]).tocsr()
+        raise ValueError("unknown topology " + mode)
     out = cores[body[0]]
     for k in body[1:]:
         out = out @ cores[k]
@@ -103,7 +116,7 @@ def price_bodies(cores, n, factKeys, factRels, nRel, bodies):
 
 
 def learn_rules(entities, relations, rows, cols, rIdx, depth, ruleCount, minSupport, maxBodies=4000,
-                inverse=False, constants=False):
+                inverse=False, constants=False, topology="chain"):
     n, nRel = len(entities), len(relations)
     headCores = K.relation_cores(rows, cols, rIdx, n, nRel)
     cores = headCores + [c.T.tocsr() for c in headCores] if inverse else headCores
@@ -115,9 +128,18 @@ def learn_rules(entities, relations, rows, cols, rIdx, depth, ruleCount, minSupp
     rangOverlap = np.array([overlaps(rang[h], rang) for h in range(nRel)])
     joint = np.array([overlaps(rang[a], dom) for a in range(nAtom)])
 
-    bodies = [(a, b) for a in range(nAtom) for b in range(nAtom) if joint[a, b]]
-    print("{} of {} two-premise bodies pass domain/range pruning over {} atoms".format(
-        len(bodies), nAtom ** 2, nAtom), flush=True)
+    bodies = []
+    if topology in ("chain", "both"):
+        bodies += [(a, b) for a in range(nAtom) for b in range(nAtom) if joint[a, b]]
+    if topology in ("fork", "both"):
+        # fork: the shared intermediate is reached from both head variables, so the
+        # pairing constraint is range-range (fz) or domain-domain (fx), not range-domain
+        rangSelf = np.array([overlaps(rang[a], rang) for a in range(nAtom)])
+        domSelf = np.array([overlaps(dom[a], dom) for a in range(nAtom)])
+        bodies += [("fz", a, b) for a in range(nAtom) for b in range(nAtom) if rangSelf[a, b]]
+        bodies += [("fx", a, b) for a in range(nAtom) for b in range(nAtom) if domSelf[a, b]]
+    print("{} two-premise bodies pass pruning over {} atoms, topology={}".format(
+        len(bodies), nAtom, topology), flush=True)
     # ponytail: uniform stride keeps every relation index range represented; switch to
     # support-based pruning only if the stride measurably loses rules
     bodies = stride(bodies, maxBodies)
@@ -132,7 +154,10 @@ def learn_rules(entities, relations, rows, cols, rIdx, depth, ruleCount, minSupp
             for k in viable:
                 if support[h, k] < minSupport:
                     continue
-                a, b = allBodies[k]
+                body = allBodies[k]
+                if isinstance(body[0], str):
+                    continue                      # extensions are defined for chains only
+                a, b = body
                 for c in range(nAtom):
                     if joint[b, c]:
                         extensions.add((a, b, c))
@@ -188,8 +213,8 @@ def learn_rules(entities, relations, rows, cols, rIdx, depth, ruleCount, minSupp
         if ruleSets[h]:
             top = ruleSets[h][0]
             print("{:<42} rules={} conf={:.3f} depth={} body={} support={:g}".format(
-                relations[h][:42], len(ruleSets[h]), top["confidence"], len(top["body"]),
-                ".".join(atomName(relations, r, nRel) for r in top["body"]), top["support"]),
+                relations[h][:42], len(ruleSets[h]), top["confidence"],
+                len(top["body"]), ruleText(relations, top["body"], nRel), top["support"]),
                 flush=True)
     if constants:
         constSets = constant_rules(cores, headCores, n, nRel, nAtom, dom, rang, relations,
@@ -312,8 +337,8 @@ def exportRules(ruleSets, relations, nRel, path):
     with open(path, "w", encoding="utf-8") as f:
         for h, rules in ruleSets.items():
             for rule in rules:
-                if "body" not in rule:
-                    skipped += 1          # constant rules have no chain form to export
+                if "body" not in rule or isinstance(rule["body"][0], str):
+                    skipped += 1          # constant and fork rules have no chain form
                     continue
                 atoms, prev = [], "X"
                 body = rule["body"]
@@ -329,6 +354,15 @@ def exportRules(ruleSets, relations, nRel, path):
                 nBodies += 1
     print("exported {} rules to {} ({} constant rules not representable)".format(
         nBodies, path, skipped), flush=True)
+
+
+def ruleText(relations, body, nRel):
+    if isinstance(body[0], str):
+        mode, atoms = body[0], body[1:]
+        left = atomName(relations, atoms[0], nRel)
+        right = atomName(relations, atoms[1], nRel)
+        return "{} & {}".format(left, right) if mode == "fz" else "{} & {}".format(left, right)
+    return ".".join(atomName(relations, a, nRel) for a in body)
 
 
 def atomName(relations, atom, nRel):
@@ -348,7 +382,7 @@ def read_triples(path, entIndex, relIndex):
 
 
 def evaluate(cores, ruleSets, n, relations, entIndex, relIndex, trainIdx, extraPaths, testPath,
-             maxTest=None, priorOnly=False, aggregation="max", direction="both"):
+             maxTest=None, priorOnly=False, aggregation="max", direction="both", dumpPath=None):
     known, knownHeads = {}, {}
     for h, r, t in trainIdx:
         known.setdefault((h, r), set()).add(t)
@@ -444,6 +478,10 @@ def evaluate(cores, ruleSets, n, relations, entIndex, relIndex, trainIdx, extraP
                     headPositives.append(int((row > 0).sum()))
     ranks = np.array(ranks, dtype=np.float64)
     positives = np.array(positives, dtype=np.float64)
+    if dumpPath:
+        np.savez(dumpPath, tail=ranks, head=np.array(headRanks, dtype=np.float64))
+        print("dumped {} tail and {} head ranks to {}".format(ranks.size, len(headRanks), dumpPath),
+              flush=True)
     if ranks.size == 0:
         print("no test triple covered by any rule", flush=True)
         return None
@@ -467,6 +505,31 @@ def evaluate(cores, ruleSets, n, relations, entIndex, relIndex, trainIdx, extraP
             float((allRanks <= 3).mean()), float((allRanks <= 10).mean())), flush=True)
         return float((1.0 / allRanks).mean())
     return float((1.0 / ranks).mean())
+
+
+def forkSelftest():
+    """h(x,y) holds exactly when some z has a(x,z) and b(y,z): the fork must recover it."""
+    n, nRel = 150, 3
+    rng = np.random.default_rng(11)
+    k = 3
+    A = np.zeros((n, n), dtype=bool)
+    B = np.zeros((n, n), dtype=bool)
+    A[np.arange(n)[:, None], rng.integers(0, n, size=(n, k))] = True
+    B[np.arange(n)[:, None], rng.integers(0, n, size=(n, k))] = True
+    H = (A.astype(np.int32) @ B.astype(np.int32).T) > 0
+    rows, cols, rels = [], [], []
+    for mat, rel in ((A, 0), (B, 1), (H, 2)):
+        xs, ys = np.nonzero(mat)
+        rows.extend(xs.tolist()); cols.extend(ys.tolist()); rels.extend([rel] * len(xs))
+    rows, cols, rels = np.array(rows), np.array(cols), np.array(rels)
+    cores = K.relation_cores(rows, cols, rels, n, nRel)
+    body = ("fz", 0, 1)
+    path = chain(cores, body)
+    assert path.nnz == H.sum(), "fork scores {} pairs, planted {} ".format(path.nnz, H.sum())
+    chainPath = chain(cores, (0, 1))
+    assert chainPath.nnz != H.sum(), "planted fork must not be expressible as a chain"
+    print("fork selftest passed: fork recovers {} pairs, chain gives {}".format(
+        path.nnz, chainPath.nnz), flush=True)
 
 
 def constSelftest():
@@ -539,9 +602,14 @@ if __name__ == "__main__":
     parser.add_argument("--inverse", action="store_true")
     parser.add_argument("--export", default=None)
     parser.add_argument("--constants", action="store_true")
+    parser.add_argument("--topology", default="chain", choices=["chain", "fork", "both"])
+    parser.add_argument("--dumpRanks", default=None)
     parser.add_argument("--constselftest", action="store_true")
+    parser.add_argument("--forkselftest", action="store_true")
     args = parser.parse_args()
-    if args.constselftest:
+    if args.forkselftest:
+        forkSelftest()
+    elif args.constselftest:
         constSelftest()
     elif args.selftest:
         selftest()
@@ -552,10 +620,11 @@ if __name__ == "__main__":
         relIndex = {r: i for i, r in enumerate(relations)}
         cores, ruleSets, bodies, n, total = learn_rules(entities, relations, rows, cols, rIdx,
                                                         args.depth, args.rules, args.minSupport,
-                                                        args.maxBodies, args.inverse, args.constants)
+                                                        args.maxBodies, args.inverse, args.constants,
+                                                        args.topology)
         if args.export:
             exportRules(ruleSets, relations, len(relations), args.export)
         trainIdx = list(zip(rows.tolist(), rIdx.tolist(), cols.tolist()))
         evaluate(cores, ruleSets, n, relations, entIndex, relIndex, trainIdx,
                  [os.path.join(args.dir, "valid.txt")], os.path.join(args.dir, "test.txt"),
-                 args.maxTest, args.priorOnly, args.aggregation)
+                 args.maxTest, args.priorOnly, args.aggregation, "both", args.dumpRanks)
