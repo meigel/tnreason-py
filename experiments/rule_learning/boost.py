@@ -75,6 +75,12 @@ def stride(items, limit):
     return [items[int(i * step)] for i in range(limit)]
 
 
+def diagonal(keep):
+    """Sparse diagonal of a 0/1 vector: masks rows or columns without dense broadcasting."""
+    n = keep.size
+    return sparse.csr_matrix((keep.astype(np.float32), (np.arange(n), np.arange(n))), shape=(n, n))
+
+
 def chain(cores, body):
     """Score matrix over (X,Y) for a body: a path, or a fork joined off that path.
 
@@ -88,6 +94,19 @@ def chain(cores, body):
             return (cores[atoms[0]] @ cores[atoms[1]].T).tocsr()
         if mode == "fx":
             return (cores[atoms[0]].T @ cores[atoms[1]]).tocsr()
+        if mode in ("tx", "ty", "tz"):
+            # three-literal tree: a chain r(X,Z), s(Z,Y) with a third premise t hung off
+            # X (tx), Y (ty) or the intermediate Z (tz); the hung variable is existential
+            a, b, t = atoms
+            path = (cores[a] @ cores[b]).tocsr()
+            if mode == "tx":
+                keep = np.asarray((cores[t].getnnz(axis=1) > 0)).ravel()
+                return (diagonal(keep) @ path).tocsr()
+            if mode == "ty":
+                keep = np.asarray((cores[t].getnnz(axis=0) > 0)).ravel()
+                return (path @ diagonal(keep)).tocsr()
+            keep = np.asarray((cores[t].getnnz(axis=1) > 0)).ravel()
+            return (cores[a] @ diagonal(keep) @ cores[b]).tocsr()
         raise ValueError("unknown topology " + mode)
     out = cores[body[0]]
     for k in body[1:]:
@@ -129,9 +148,10 @@ def learn_rules(entities, relations, rows, cols, rIdx, depth, ruleCount, minSupp
     joint = np.array([overlaps(rang[a], dom) for a in range(nAtom)])
 
     bodies = []
-    if topology in ("chain", "both"):
+    # trees hang off a two-literal chain, so the chain base is always enumerated
+    if topology in ("chain", "both", "tree", "all"):
         bodies += [(a, b) for a in range(nAtom) for b in range(nAtom) if joint[a, b]]
-    if topology in ("fork", "both"):
+    if topology in ("fork", "both", "all"):
         # fork: the shared intermediate is reached from both head variables, so the
         # pairing constraint is range-range (fz) or domain-domain (fx), not range-domain
         rangSelf = np.array([overlaps(rang[a], rang) for a in range(nAtom)])
@@ -168,6 +188,36 @@ def learn_rules(entities, relations, rows, cols, rIdx, depth, ruleCount, minSupp
             start = len(allBodies)
             allBodies.extend(extensions)
             for k in p3:                      # bodies with empty paths keep their column
+                paths[start + k] = p3[k]
+            support = np.hstack([support, s3])
+            bodyNnz = np.hstack([bodyNnz, n3])
+
+    if topology in ("tree", "all"):
+        domSelf3 = np.array([overlaps(dom[a], dom) for a in range(nAtom)])
+        rangSelf3 = np.array([overlaps(rang[a], rang) for a in range(nAtom)])
+        trees = set()
+        for h in range(nRel):
+            viable = [k for k, body in enumerate(allBodies[:len(bodies)]) if not isinstance(body[0], str)
+                      and domOverlap[h, body[0]] and rangOverlap[h, body[1]]]
+            viable = sorted(viable, key=lambda k: -support[h, k])[:5]
+            for k in viable:
+                if support[h, k] < minSupport:
+                    continue
+                a, b = allBodies[k]
+                for t in range(nAtom):
+                    if domSelf3[t, a]:
+                        trees.add(("tx", a, b, t))
+                    if rangSelf3[t, b]:
+                        trees.add(("ty", a, b, t))
+                    if domSelf3[t, b]:
+                        trees.add(("tz", a, b, t))
+        trees = stride(sorted(trees), maxBodies)
+        print("{} three-literal trees after pruning".format(len(trees)), flush=True)
+        if trees:
+            s3, n3, p3 = price_bodies(cores, n, factKeys, factRels, nRel, trees)
+            start = len(allBodies)
+            allBodies.extend(trees)
+            for k in p3:
                 paths[start + k] = p3[k]
             support = np.hstack([support, s3])
             bodyNnz = np.hstack([bodyNnz, n3])
@@ -358,10 +408,7 @@ def exportRules(ruleSets, relations, nRel, path):
 
 def ruleText(relations, body, nRel):
     if isinstance(body[0], str):
-        mode, atoms = body[0], body[1:]
-        left = atomName(relations, atoms[0], nRel)
-        right = atomName(relations, atoms[1], nRel)
-        return "{} & {}".format(left, right) if mode == "fz" else "{} & {}".format(left, right)
+        return " & ".join(atomName(relations, a, nRel) for a in body[1:])
     return ".".join(atomName(relations, a, nRel) for a in body)
 
 
@@ -532,6 +579,33 @@ def forkSelftest():
         path.nnz, chainPath.nnz), flush=True)
 
 
+def treeSelftest():
+    """h(x,y) holds when a(x,z) ^ b(z,y) and x has any c(x,w): the tx tree must recover it."""
+    n, nRel = 150, 4
+    rng = np.random.default_rng(5)
+    k = 3
+    A = np.zeros((n, n), dtype=bool)
+    B = np.zeros((n, n), dtype=bool)
+    C = np.zeros((n, n), dtype=bool)
+    A[np.arange(n)[:, None], rng.integers(0, n, size=(n, k))] = True
+    B[np.arange(n)[:, None], rng.integers(0, n, size=(n, k))] = True
+    sparseRows = np.where(np.arange(n) % 3 == 0)[0]          # only a third of x have a c edge
+    C[sparseRows[:, None], rng.integers(0, n, size=(sparseRows.size, k))] = True
+    H = ((A.astype(np.int32) @ B.astype(np.int32)) > 0) & (C.any(axis=1)[:, None])
+    rows, cols, rels = [], [], []
+    for mat, rel in ((A, 0), (B, 1), (C, 2), (H, 3)):
+        xs, ys = np.nonzero(mat)
+        rows.extend(xs.tolist()); cols.extend(ys.tolist()); rels.extend([rel] * len(xs))
+    cores = K.relation_cores(np.array(rows), np.array(cols), np.array(rels), n, nRel)
+    tree = chain(cores, ("tx", 0, 1, 2))
+    assert tree.nnz == H.sum(), "tx tree scores {} pairs, planted {}".format(tree.nnz, H.sum())
+    plain = chain(cores, (0, 1))
+    assert plain.nnz != H.sum(), "planted tree must not equal the bare chain"
+    tz = chain(cores, ("tz", 0, 1, 2))
+    assert tz.shape == (n, n) and tz.nnz > 0, "tz tree did not score"
+    print("tree selftest passed: tx recovers {} pairs, bare chain {}".format(tree.nnz, plain.nnz), flush=True)
+
+
 def constSelftest():
     """A rule h(X,Y) <= r(X,c) planted exactly must return precision 1.0."""
     n, nRel = 200, 2
@@ -602,12 +676,15 @@ if __name__ == "__main__":
     parser.add_argument("--inverse", action="store_true")
     parser.add_argument("--export", default=None)
     parser.add_argument("--constants", action="store_true")
-    parser.add_argument("--topology", default="chain", choices=["chain", "fork", "both"])
+    parser.add_argument("--topology", default="chain", choices=["chain", "fork", "both", "tree", "all"])
     parser.add_argument("--dumpRanks", default=None)
     parser.add_argument("--constselftest", action="store_true")
     parser.add_argument("--forkselftest", action="store_true")
+    parser.add_argument("--treeselftest", action="store_true")
     args = parser.parse_args()
-    if args.forkselftest:
+    if args.treeselftest:
+        treeSelftest()
+    elif args.forkselftest:
         forkSelftest()
     elif args.constselftest:
         constSelftest()
