@@ -80,6 +80,7 @@ _POLY_RIGHT = None
 _SPARSE_LEFT = None
 _SPARSE_RIGHT = None
 _FEATURES = None
+_NEGATIVE = []
 
 
 def load_features(path, entities):
@@ -186,6 +187,12 @@ def chain(cores, body):
         return sparse_chain(cores, body)
     if _POLY_LEFT is not None and not isinstance(body[0], str) and len(body) == 2:
         return poly_chain(cores, body)
+    if isinstance(body[0], str) and body[0] == "neg":
+        # r_a(X,Z) & r_b(Z,Y) & not r_c(X,Y): the negated atom is evaluated only where the
+        # rest of the body has support, so the complement is never formed.
+        base = chain(cores, tuple(body[1:3]))
+        blocked = cores[body[3]]
+        return (base - base.multiply(blocked)).tocsr()
     if isinstance(body[0], str) and body[0] in ("cmp>", "cmp<"):
         operator, a, b = body[0][3:], body[1], body[2]
         return (comparison_mask(cores[a], _FEATURES, operator) @ cores[b]).tocsr()
@@ -269,6 +276,16 @@ def learn_rules(entities, relations, rows, cols, rIdx, depth, ruleCount, minSupp
         bodies += cmpBodies
         print("{} comparison bodies added (feature range {:.3g} to {:.3g})".format(
             len(cmpBodies), float(_FEATURES.min()), float(_FEATURES.max())), flush=True)
+    if _NEGATIVE:
+        # negating a sparse relation is nearly vacuous, so only dense relations are candidates
+        negBodies = []
+        for a in range(nAtom):
+            for b in np.nonzero(joint[a])[0]:
+                for c in _NEGATIVE:
+                    negBodies.append(("neg", a, int(b), c))
+        bodies += negBodies
+        print("{} negation bodies added over {} dense relations".format(
+            len(negBodies), len(_NEGATIVE)), flush=True)
     print("{} two-premise bodies pass pruning over {} atoms, topology={}".format(
         len(bodies), nAtom, topology), flush=True)
     # ponytail: uniform stride keeps every relation index range represented; switch to
@@ -518,6 +535,10 @@ def exportRules(ruleSets, relations, nRel, path):
 
 
 def ruleText(relations, body, nRel):
+    if isinstance(body[0], str) and body[0] == "neg":
+        return "{}(X,Z) & {}(Z,Y) & not {}(X,Y)".format(
+            atomName(relations, body[1], nRel), atomName(relations, body[2], nRel),
+            atomName(relations, body[3], nRel))
     if isinstance(body[0], str) and body[0] in ("cmp>", "cmp<"):
         operator = ">" if body[0] == "cmp>" else "<"
         return "{}(X,Z) & feature(X) {} feature(Z) & {}(Z,Y)".format(
@@ -795,6 +816,8 @@ if __name__ == "__main__":
     parser.add_argument("--dumpRanks", default=None)
     parser.add_argument("--pricing", default="sparse", choices=["sparse", "tnreason", "tnreason-sparse"])
     parser.add_argument("--features", default=None)
+    parser.add_argument("--negation", type=float, default=None,
+                        help="negate relations whose density exceeds this value")
     parser.add_argument("--constselftest", action="store_true")
     parser.add_argument("--forkselftest", action="store_true")
     parser.add_argument("--treeselftest", action="store_true")
@@ -814,6 +837,16 @@ if __name__ == "__main__":
             import sys as _sys
             values, _seen = load_features(args.features, entities)
             _sys.modules[__name__]._FEATURES = values
+        if args.negation is not None:
+            import sys as _sys
+            forward = K.relation_cores(rows, cols, rIdx, len(entities), len(relations))
+            densities = np.asarray([m.nnz for m in forward], dtype=np.float64) / \
+                float(len(entities) ** 2)
+            dense = [i for i, d in enumerate(densities) if d >= args.negation]
+            _sys.modules[__name__]._NEGATIVE = dense
+            print("{} of {} relations dense enough to negate (density >= {}): {}".format(
+                len(dense), len(densities), args.negation,
+                ", ".join(relations[i] for i in dense[:6])), flush=True)
         entIndex = {e: i for i, e in enumerate(entities)}
         relIndex = {r: i for i, r in enumerate(relations)}
         if args.pricing == "tnreason-sparse":
