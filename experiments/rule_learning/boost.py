@@ -79,6 +79,39 @@ _POLY_LEFT = None
 _POLY_RIGHT = None
 _SPARSE_LEFT = None
 _SPARSE_RIGHT = None
+_FEATURES = None
+
+
+def load_features(path, entities):
+    """One numeric feature per entity, zero where absent."""
+    index = {e: i for i, e in enumerate(entities)}
+    values = np.zeros(len(entities), dtype=np.float64)
+    seen = np.zeros(len(entities), dtype=bool)
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 2 or parts[0] not in index:
+                continue
+            values[index[parts[0]]] = float(parts[1])
+            seen[index[parts[0]]] = True
+    return values, seen
+
+
+def comparison_mask(matrix, features, operator):
+    """Keep the entries of a relation whose feature comparison holds.
+
+    The comparison factor is dense in general, but a body only ever needs it where a relational atom
+    has an edge, so the operator reduces to a mask over the existing nonzeros. Cost is the nonzero
+    count, not the square of the entity count.
+    """
+    coo = matrix.tocoo()
+    if operator == ">":
+        keep = features[coo.row] > features[coo.col]
+    elif operator == "<":
+        keep = features[coo.row] < features[coo.col]
+    else:
+        raise ValueError("unknown comparison " + operator)
+    return sparse.csr_matrix((coo.data[keep], (coo.row[keep], coo.col[keep])), shape=matrix.shape)
 
 
 def build_sparse_cores(cores, n):
@@ -153,6 +186,9 @@ def chain(cores, body):
         return sparse_chain(cores, body)
     if _POLY_LEFT is not None and not isinstance(body[0], str) and len(body) == 2:
         return poly_chain(cores, body)
+    if isinstance(body[0], str) and body[0] in ("cmp>", "cmp<"):
+        operator, a, b = body[0][3:], body[1], body[2]
+        return (comparison_mask(cores[a], _FEATURES, operator) @ cores[b]).tocsr()
     if isinstance(body[0], str):
         mode, atoms = body[0], body[1:]
         if mode == "fz":
@@ -223,6 +259,16 @@ def learn_rules(entities, relations, rows, cols, rIdx, depth, ruleCount, minSupp
         domSelf = np.array([overlaps(dom[a], dom) for a in range(nAtom)])
         bodies += [("fz", a, b) for a in range(nAtom) for b in range(nAtom) if rangSelf[a, b]]
         bodies += [("fx", a, b) for a in range(nAtom) for b in range(nAtom) if domSelf[a, b]]
+    if _FEATURES is not None:
+        # a comparison between the head variable and the intermediate, on top of a two-literal chain
+        cmpBodies = []
+        for a in range(nAtom):
+            for b in np.nonzero(joint[a])[0]:
+                for operator in (">", "<"):
+                    cmpBodies.append(("cmp" + operator, a, int(b)))
+        bodies += cmpBodies
+        print("{} comparison bodies added (feature range {:.3g} to {:.3g})".format(
+            len(cmpBodies), float(_FEATURES.min()), float(_FEATURES.max())), flush=True)
     print("{} two-premise bodies pass pruning over {} atoms, topology={}".format(
         len(bodies), nAtom, topology), flush=True)
     # ponytail: uniform stride keeps every relation index range represented; switch to
@@ -472,6 +518,10 @@ def exportRules(ruleSets, relations, nRel, path):
 
 
 def ruleText(relations, body, nRel):
+    if isinstance(body[0], str) and body[0] in ("cmp>", "cmp<"):
+        operator = ">" if body[0] == "cmp>" else "<"
+        return "{}(X,Z) & feature(X) {} feature(Z) & {}(Z,Y)".format(
+            atomName(relations, body[1], nRel), operator, atomName(relations, body[2], nRel))
     if isinstance(body[0], str):
         return " & ".join(atomName(relations, a, nRel) for a in body[1:])
     return ".".join(atomName(relations, a, nRel) for a in body)
@@ -744,6 +794,7 @@ if __name__ == "__main__":
     parser.add_argument("--topology", default="chain", choices=["chain", "fork", "both", "tree", "all"])
     parser.add_argument("--dumpRanks", default=None)
     parser.add_argument("--pricing", default="sparse", choices=["sparse", "tnreason", "tnreason-sparse"])
+    parser.add_argument("--features", default=None)
     parser.add_argument("--constselftest", action="store_true")
     parser.add_argument("--forkselftest", action="store_true")
     parser.add_argument("--treeselftest", action="store_true")
@@ -759,6 +810,10 @@ if __name__ == "__main__":
     else:
         trainPath = os.path.join(args.dir, "train.txt")
         entities, relations, rows, cols, rIdx = K.load_triples(trainPath)
+        if args.features:
+            import sys as _sys
+            values, _seen = load_features(args.features, entities)
+            _sys.modules[__name__]._FEATURES = values
         entIndex = {e: i for i, e in enumerate(entities)}
         relIndex = {r: i for i, r in enumerate(relations)}
         if args.pricing == "tnreason-sparse":
