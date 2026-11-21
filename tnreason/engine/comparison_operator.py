@@ -86,6 +86,28 @@ def _self_check():
         print("operator {}: matches the materialised factor, max difference {:.1e}".format(
             operator, difference))
 
+    # an affine transform of one side is still a monotone comparison, so it stays a sort
+    for alpha, beta in ((2.0, 3.0), (0.5, -1.0)):
+        for operator in ("<", ">"):
+            scaled = ComparisonOperator(alpha * left + beta, right, operator).apply(weights)
+            dense = weights.toarray() @ materialized(alpha * left + beta, right, operator)
+            difference = np.abs(scaled.toarray() - dense).max()
+            assert difference < 1e-10, "affine {} {} disagrees: {}".format(alpha, operator, difference)
+            print("affine alpha={} beta={} operator {}: matches to {:.1e}".format(
+                alpha, beta, operator, difference))
+
+    # a genuinely two-sided comparison is not a sort on either side: it needs a 2-D structure
+    a2 = rng.random((n, 2))
+    orderByFirst = np.argsort(a2[:, 0])
+    blocks = np.searchsorted(a2[orderByFirst, 0], a2[:, 0])
+    violation = 0
+    for i in range(n):
+        for j in range(n):
+            if a2[i].sum() < a2[j].sum() and orderByFirst[blocks[i]] > orderByFirst[blocks[j]]:
+                violation += 1
+    print("two-sided sums: {} pairs where a 1-D sort on one column gives the wrong order".format(
+        violation))
+
     full = 40 * 40
     stored = weights.nnz
     print("materialising the factor would store {} entries per body; applying it stores {}".format(
