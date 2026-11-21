@@ -75,6 +75,44 @@ def stride(items, limit):
     return [items[int(i * step)] for i in range(limit)]
 
 
+_POLY_LEFT = None
+_POLY_RIGHT = None
+
+
+def build_poly_cores(cores, n):
+    """One PolynomialCore per atom, in two orientations so any body can be read as a chain.
+
+    The monomial keys must be the colours the core declares, otherwise the shared variable never
+    matches and every contraction is empty.
+    """
+    from tnreason import engine
+    left, right = [], []
+    for c in cores:
+        xs, ys = c.nonzero()
+        left.append(engine.get_core("PolynomialCore")(
+            values=[(1.0, {"X": int(x), "Z": int(y)}) for x, y in zip(xs, ys)],
+            colors=["X", "Z"], shape=[n, n], name="left"))
+        right.append(engine.get_core("PolynomialCore")(
+            values=[(1.0, {"Z": int(x), "Y": int(y)}) for x, y in zip(xs, ys)],
+            colors=["Z", "Y"], shape=[n, n], name="right"))
+    return left, right
+
+
+def poly_chain(cores, body):
+    """Price a two-literal body through tnreason's polynomial contractor, returned as a sparse matrix."""
+    from tnreason import engine
+    a, b = body
+    res = engine.contract(coreDict={"l": _POLY_LEFT[a], "r": _POLY_RIGHT[b]},
+                          openColors=["X", "Y"], contractionMethod="CorewiseContractor")
+    rows, cols = [], []
+    for value, position in res.values:
+        if value != 0 and "X" in position and "Y" in position:
+            rows.append(position["X"])
+            cols.append(position["Y"])
+    n = _POLY_LEFT[a].shape[0]
+    return sparse.csr_matrix((np.ones(len(rows), dtype=np.float32), (rows, cols)), shape=(n, n))
+
+
 def diagonal(keep):
     """Sparse diagonal of a 0/1 vector: masks rows or columns without dense broadcasting."""
     n = keep.size
@@ -88,6 +126,8 @@ def chain(cores, body):
     ("fz", a, b) meaning r_a(X,Z) and r_b(Y,Z) with Z shared off the path, or
     ("fx", a, b) meaning r_a(Z,X) and r_b(Z,Y).
     """
+    if _POLY_LEFT is not None and not isinstance(body[0], str) and len(body) == 2:
+        return poly_chain(cores, body)
     if isinstance(body[0], str):
         mode, atoms = body[0], body[1:]
         if mode == "fz":
@@ -678,6 +718,7 @@ if __name__ == "__main__":
     parser.add_argument("--constants", action="store_true")
     parser.add_argument("--topology", default="chain", choices=["chain", "fork", "both", "tree", "all"])
     parser.add_argument("--dumpRanks", default=None)
+    parser.add_argument("--pricing", default="sparse", choices=["sparse", "tnreason"])
     parser.add_argument("--constselftest", action="store_true")
     parser.add_argument("--forkselftest", action="store_true")
     parser.add_argument("--treeselftest", action="store_true")
@@ -695,6 +736,14 @@ if __name__ == "__main__":
         entities, relations, rows, cols, rIdx = K.load_triples(trainPath)
         entIndex = {e: i for i, e in enumerate(entities)}
         relIndex = {r: i for i, r in enumerate(relations)}
+        if args.pricing == "tnreason":
+            headCores = K.relation_cores(rows, cols, rIdx, len(entities), len(relations))
+            allCores = headCores + [c.T.tocsr() for c in headCores] if args.inverse else headCores
+            import sys
+            module = sys.modules[__name__]
+            module._POLY_LEFT, module._POLY_RIGHT = build_poly_cores(allCores, len(entities))
+            print("built {} polynomial cores per orientation for tnreason pricing".format(len(_POLY_LEFT)),
+                  flush=True)
         cores, ruleSets, bodies, n, total = learn_rules(entities, relations, rows, cols, rIdx,
                                                         args.depth, args.rules, args.minSupport,
                                                         args.maxBodies, args.inverse, args.constants,
