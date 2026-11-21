@@ -290,6 +290,7 @@ if __name__ == "__main__":
     parser.add_argument("--rules", default="/Users/eigel/work/tools/anyburl/rules-10")
     parser.add_argument("--dir", default=os.path.join(HERE, "data", "fb15k237"))
     parser.add_argument("--maxPerHead", type=int, default=60)
+    parser.add_argument("--aggregation", default="max", choices=["max", "sum"])
     args = parser.parse_args()
     if args.selfcheck:
         selfcheck()
@@ -307,4 +308,4 @@ if __name__ == "__main__":
         trainIdx = list(zip(rows.tolist(), rIdx.tolist(), cols.tolist()))
         B.evaluate(cores, ruleSets, len(entities), relations, entIndex, relIndex, trainIdx,
                    [os.path.join(args.dir, "valid.txt")], os.path.join(args.dir, "test.txt"),
-                   None, False, "max")
+                   None, False, args.aggregation)
