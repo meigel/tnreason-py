@@ -77,6 +77,20 @@ def stride(items, limit):
 
 _POLY_LEFT = None
 _POLY_RIGHT = None
+_SPARSE_LEFT = None
+_SPARSE_RIGHT = None
+
+
+def build_sparse_cores(cores, n):
+    """One tnreason sparse core per atom, in both orientations, contracted by the compiled kernel."""
+    from tnreason import engine
+    left, right = [], []
+    for c in cores:
+        left.append(engine.get_core("ScipySparseCore")(values=c, colors=["X", "Z"], shape=[n, n],
+                                                       name="left"))
+        right.append(engine.get_core("ScipySparseCore")(values=c, colors=["Z", "Y"], shape=[n, n],
+                                                        name="right"))
+    return left, right
 
 
 def build_poly_cores(cores, n):
@@ -96,6 +110,15 @@ def build_poly_cores(cores, n):
             values=[(1.0, {"Z": int(x), "Y": int(y)}) for x, y in zip(xs, ys)],
             colors=["Z", "Y"], shape=[n, n], name="right"))
     return left, right
+
+
+def sparse_chain(cores, body):
+    """Price a two-literal body through tnreason's compiled sparse contractor."""
+    from tnreason import engine
+    a, b = body
+    res = engine.contract(coreDict={"l": _SPARSE_LEFT[a], "r": _SPARSE_RIGHT[b]},
+                          openColors=["X", "Y"], contractionMethod="ScipySparse")
+    return res.values.tocsr()
 
 
 def poly_chain(cores, body):
@@ -126,6 +149,8 @@ def chain(cores, body):
     ("fz", a, b) meaning r_a(X,Z) and r_b(Y,Z) with Z shared off the path, or
     ("fx", a, b) meaning r_a(Z,X) and r_b(Z,Y).
     """
+    if _SPARSE_LEFT is not None and not isinstance(body[0], str) and len(body) == 2:
+        return sparse_chain(cores, body)
     if _POLY_LEFT is not None and not isinstance(body[0], str) and len(body) == 2:
         return poly_chain(cores, body)
     if isinstance(body[0], str):
@@ -718,7 +743,7 @@ if __name__ == "__main__":
     parser.add_argument("--constants", action="store_true")
     parser.add_argument("--topology", default="chain", choices=["chain", "fork", "both", "tree", "all"])
     parser.add_argument("--dumpRanks", default=None)
-    parser.add_argument("--pricing", default="sparse", choices=["sparse", "tnreason"])
+    parser.add_argument("--pricing", default="sparse", choices=["sparse", "tnreason", "tnreason-sparse"])
     parser.add_argument("--constselftest", action="store_true")
     parser.add_argument("--forkselftest", action="store_true")
     parser.add_argument("--treeselftest", action="store_true")
@@ -736,6 +761,14 @@ if __name__ == "__main__":
         entities, relations, rows, cols, rIdx = K.load_triples(trainPath)
         entIndex = {e: i for i, e in enumerate(entities)}
         relIndex = {r: i for i, r in enumerate(relations)}
+        if args.pricing == "tnreason-sparse":
+            import sys as _sys
+            module = _sys.modules[__name__]
+            headCores = K.relation_cores(rows, cols, rIdx, len(entities), len(relations))
+            allCores = headCores + [c.T.tocsr() for c in headCores] if args.inverse else headCores
+            module._SPARSE_LEFT, module._SPARSE_RIGHT = build_sparse_cores(allCores, len(entities))
+            print("built {} compiled sparse cores per orientation".format(len(module._SPARSE_LEFT)),
+                  flush=True)
         if args.pricing == "tnreason":
             headCores = K.relation_cores(rows, cols, rIdx, len(entities), len(relations))
             allCores = headCores + [c.T.tocsr() for c in headCores] if args.inverse else headCores
